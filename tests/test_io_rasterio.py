@@ -1291,6 +1291,7 @@ def test_tile_small_dataset_in_world_tile():
             assert rows.min() >= (tb.top - fp[3]) / y_res - 1
             assert rows.max() <= (tb.top - fp[1]) / y_res + 1
 
-        # the southern hemisphere: the dataset is not there at all
-        img = src.tile(0, 1, 1)
-        assert not img.mask.any()
+        # tiles the dataset is not in at all (it is in Greenland)
+        for z, x, y in [(1, 0, 1), (1, 1, 1), (1, 1, 0), (2, 1, 2), (3, 2, 1)]:
+            if src.tile_exists(x, y, z):
+                assert not src.tile(x, y, z).mask.any(), (z, x, y)

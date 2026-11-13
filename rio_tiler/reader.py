@@ -342,13 +342,14 @@ def _mask_outside_footprint(
     x_res = (b[2] - b[0]) / img.width
     y_res = (b[3] - b[1]) / img.height
     # one pixel of margin: the footprint bounds are an approximation
-    col_start = max(0, math.floor((fp[0] - b[0]) / x_res) - 1)
-    col_stop = min(img.width, math.ceil((fp[2] - b[0]) / x_res) + 1)
-    row_start = max(0, math.floor((b[3] - fp[3]) / y_res) - 1)
-    row_stop = min(img.height, math.ceil((b[3] - fp[1]) / y_res) + 1)
+    col_start = math.floor((fp[0] - b[0]) / x_res) - 1
+    col_stop = math.ceil((fp[2] - b[0]) / x_res) + 1
+    row_start = math.floor((b[3] - fp[3]) / y_res) - 1
+    row_stop = math.ceil((b[3] - fp[1]) / y_res) + 1
 
     outside = numpy.ones((img.height, img.width), dtype=bool)
-    outside[row_start:row_stop, col_start:col_stop] = False
+    if col_stop > 0 and row_stop > 0 and col_start < img.width and row_start < img.height:
+        outside[max(0, row_start) : row_stop, max(0, col_start) : col_stop] = False
     if not outside.any():
         return
 
