@@ -6,7 +6,6 @@ import warnings
 from collections.abc import Callable
 from typing import TypedDict, cast
 
-import attr
 import numpy
 from affine import Affine
 from rasterio import windows
@@ -316,77 +315,46 @@ def read(
 # flake8: noqa: C901
 
 
-# A dataset that is at most this fraction of the requested width and height is
-# "small": its inverse projection may wrap onto far-away parts of the request.
-_SMALL_FOOTPRINT = 0.1
+def _mask_outside_footprint(
+    img: ImageData, src_dst: DatasetReader | DatasetWriter | WarpedVRT
+) -> None:
+    """Mask the pixels of a reprojected read that lie outside the dataset.
 
-
-def _footprint_clip(
-    src_dst: DatasetReader | DatasetWriter | WarpedVRT,
-    dst_crs: CRS,
-    bounds: BBox,
-    width: int,
-    height: int,
-) -> tuple[BBox, tuple[slice, slice]] | None:
-    """Sub-bounds to warp when the dataset is small within `bounds`.
-
-    Returns the clipped bounds, snapped to whole output pixels so the pixels
-    come out on the same grid as a full read, and the (row, col) slices of the
-    output they fill. None when the dataset is not small within `bounds`.
+    Far from a small dataset the inverse projection can wrap back onto it
+    (e.g. a UTM dataset in a world-scale WebMercator tile), so the warp paints
+    the dataset onto output pixels thousands of kilometres away.
     """
+    if img.crs is None or img.bounds is None or img.crs == src_dst.crs:
+        return
+
     try:
-        fp = transform_bounds(src_dst.crs, dst_crs, *src_dst.bounds, densify_pts=21)
+        fp = transform_bounds(src_dst.crs, img.crs, *src_dst.bounds, densify_pts=21)
     except Exception:  # noqa: BLE001
-        return None
+        return
 
     if not all(math.isfinite(v) for v in fp):
-        return None
+        return
 
-    x_res = (bounds[2] - bounds[0]) / width
-    y_res = (bounds[3] - bounds[1]) / height
-    if (fp[2] - fp[0]) > _SMALL_FOOTPRINT * (bounds[2] - bounds[0]) or (
-        fp[3] - fp[1]
-    ) > _SMALL_FOOTPRINT * (bounds[3] - bounds[1]):
-        return None
+    b = img.bounds
+    if fp[0] <= b[0] and fp[1] <= b[1] and fp[2] >= b[2] and fp[3] >= b[3]:
+        return
 
-    col_start = min(width - 1, max(0, math.floor((fp[0] - bounds[0]) / x_res)))
-    col_stop = max(col_start + 1, min(width, math.ceil((fp[2] - bounds[0]) / x_res)))
-    row_start = min(height - 1, max(0, math.floor((bounds[3] - fp[3]) / y_res)))
-    row_stop = max(row_start + 1, min(height, math.ceil((bounds[3] - fp[1]) / y_res)))
+    x_res = (b[2] - b[0]) / img.width
+    y_res = (b[3] - b[1]) / img.height
+    # one pixel of margin: the footprint bounds are an approximation
+    col_start = max(0, math.floor((fp[0] - b[0]) / x_res) - 1)
+    col_stop = min(img.width, math.ceil((fp[2] - b[0]) / x_res) + 1)
+    row_start = max(0, math.floor((b[3] - fp[3]) / y_res) - 1)
+    row_stop = min(img.height, math.ceil((b[3] - fp[1]) / y_res) + 1)
 
-    clip = (
-        bounds[0] + col_start * x_res,
-        bounds[3] - row_stop * y_res,
-        bounds[0] + col_stop * x_res,
-        bounds[3] - row_start * y_res,
-    )
-    return clip, (slice(row_start, row_stop), slice(col_start, col_stop))
+    outside = numpy.ones((img.height, img.width), dtype=bool)
+    outside[row_start:row_stop, col_start:col_stop] = False
+    if not outside.any():
+        return
 
-
-def _pad(
-    img: ImageData,
-    slices: tuple[slice, slice],
-    height: int,
-    width: int,
-    bounds: BBox,
-) -> ImageData:
-    """Place `img` into a fully masked `height` x `width` image over `bounds`."""
-    array = img.array
-    fill = img.nodata if img.nodata is not None else 0
-    data = numpy.ma.MaskedArray(
-        numpy.full((array.shape[0], height, width), fill, dtype=array.dtype),
-        mask=True,
-        fill_value=array.fill_value,
-    )
-    data[:, slices[0], slices[1]] = array
-
-    alpha_mask = img.alpha_mask
-    if alpha_mask is not None:
-        full_alpha = numpy.zeros((height, width), dtype=alpha_mask.dtype)
-        full_alpha[slices] = alpha_mask
-        alpha_mask = full_alpha
-
-    return attr.evolve(img, array=data, bounds=bounds, alpha_mask=alpha_mask)
+    img.array[:, outside] = numpy.ma.masked
+    if img.alpha_mask is not None:
+        img.alpha_mask[outside] = 0
 
 
 def part(
@@ -514,44 +482,7 @@ def part(
         if vrt_options:
             vrt_params.update(**vrt_options)
 
-        # A small dataset far inside a large request (e.g. a UTM dataset in a
-        # world-scale WebMercator tile) can wrap back onto far-away output
-        # pixels through the inverse projection. Only warp where it is.
-        clip = None
-        if window is None and dst_crs != src_dst.crs:
-            clip = _footprint_clip(src_dst, dst_crs, bounds, width, height)
-
-        if clip is not None:
-            clip_bounds, slices = clip
-            clip_height = slices[0].stop - slices[0].start
-            clip_width = slices[1].stop - slices[1].start
-            vrt_transform, vrt_width, vrt_height = get_vrt_transform(
-                src_dst,
-                clip_bounds,
-                clip_height,
-                clip_width,
-                dst_crs=dst_crs,
-                align_bounds_with_dataset=align_bounds_with_dataset,
-            )
-            vrt_params.update(
-                {"transform": vrt_transform, "width": vrt_width, "height": vrt_height}
-            )
-            img = read(
-                src_dst,
-                indexes=indexes,
-                width=clip_width,
-                height=clip_height,
-                nodata=nodata,
-                vrt_options=vrt_params,
-                out_dtype=out_dtype,
-                resampling_method=resampling_method,
-                reproject_method=reproject_method,
-                unscale=unscale,
-                post_process=post_process,
-            )
-            return _pad(img, slices, height, width, bounds)
-
-        return read(
+        img = read(
             src_dst,
             indexes=indexes,
             width=width,
@@ -565,6 +496,8 @@ def part(
             unscale=unscale,
             post_process=post_process,
         )
+        _mask_outside_footprint(img, src_dst)
+        return img
 
     # else no re-projection needed
     window = windows.from_bounds(*bounds, transform=src_dst.transform)
