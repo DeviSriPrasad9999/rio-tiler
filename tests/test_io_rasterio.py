@@ -1272,3 +1272,25 @@ def test_feature_reader_vrt_options():
         img = src.feature(shape, max_size=256)
 
     numpy.testing.assert_array_equal(img.mask, expected.mask)
+
+
+def test_tile_small_dataset_in_world_tile():
+    """A UTM dataset must not wrap onto far-away pixels of a world-scale tile."""
+    with Reader(COGEO) as src:
+        fp = transform_bounds(src.crs, src.tms.rasterio_crs, *src.bounds, densify_pts=21)
+        for z, x, y in [(0, 0, 0), (1, 0, 0)]:
+            img = src.tile(x, y, z)
+            tb = src.tms.xy_bounds(x, y, z)
+            x_res = (tb.right - tb.left) / img.width
+            y_res = (tb.top - tb.bottom) / img.height
+            rows, cols = numpy.nonzero(img.mask)
+            assert len(rows), (z, x, y)
+            # every valid pixel is where the dataset is (1px tolerance)
+            assert cols.min() >= (fp[0] - tb.left) / x_res - 1
+            assert cols.max() <= (fp[2] - tb.left) / x_res + 1
+            assert rows.min() >= (tb.top - fp[3]) / y_res - 1
+            assert rows.max() <= (tb.top - fp[1]) / y_res + 1
+
+        # the southern hemisphere: the dataset is not there at all
+        img = src.tile(0, 1, 1)
+        assert not img.mask.any()

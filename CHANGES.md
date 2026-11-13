@@ -39,6 +39,7 @@
 * fix: use `@` instead of `*` for affine matrix multiplication
 * fix: compute the cumulative weights in `float64` in `rio_tiler.utils._weighted_quantiles` to avoid wrong `median`/`percentile_*` statistics with `float32` coverage arrays (https://github.com/cogeotiff/rio-tiler/issues/1045)
 * fix: run blocking warp/reproject/resize in a worker thread (`asyncio.to_thread`) in the async experimental readers (`geotiff.Reader`, `zarr.AsyncArrayReader`) to avoid blocking the event loop
+* fix: in `rio_tiler.reader.part`, warp a small reprojected dataset only where it is in the requested bounds, so its inverse projection no longer paints it onto far-away parts of a large request (e.g. a UTM dataset in a world-scale WebMercator tile)
 * fix: `rio_tiler.experimental.zarr` Array readers (`ArrayReader`, `AsyncArrayReader`) read the exact pixel window in `part()` (no extra row/column, avoiding reading neighbouring chunks); 1 pixel padding is added on each side only for `bilinear`/`cubic`/... resampling methods. Windows outside the array now raise `InvalidBounds`
 * docs: new `experimental` documentation section (async-geotiff, async-stac, geoxarray, geozarr, vsifile)
 

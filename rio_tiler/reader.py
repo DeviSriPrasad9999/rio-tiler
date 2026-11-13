@@ -1,10 +1,12 @@
 """rio-tiler.reader: low level reader."""
 
 import contextlib
+import math
 import warnings
 from collections.abc import Callable
 from typing import TypedDict, cast
 
+import attr
 import numpy
 from affine import Affine
 from rasterio import windows
@@ -312,6 +314,81 @@ def read(
 
 
 # flake8: noqa: C901
+
+
+# A dataset that is at most this fraction of the requested width and height is
+# "small": its inverse projection may wrap onto far-away parts of the request.
+_SMALL_FOOTPRINT = 0.1
+
+
+def _footprint_clip(
+    src_dst: DatasetReader | DatasetWriter | WarpedVRT,
+    dst_crs: CRS,
+    bounds: BBox,
+    width: int,
+    height: int,
+) -> tuple[BBox, tuple[slice, slice]] | None:
+    """Sub-bounds to warp when the dataset is small within `bounds`.
+
+    Returns the clipped bounds, snapped to whole output pixels so the pixels
+    come out on the same grid as a full read, and the (row, col) slices of the
+    output they fill. None when the dataset is not small within `bounds`.
+    """
+    try:
+        fp = transform_bounds(src_dst.crs, dst_crs, *src_dst.bounds, densify_pts=21)
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not all(math.isfinite(v) for v in fp):
+        return None
+
+    x_res = (bounds[2] - bounds[0]) / width
+    y_res = (bounds[3] - bounds[1]) / height
+    if (fp[2] - fp[0]) > _SMALL_FOOTPRINT * (bounds[2] - bounds[0]) or (
+        fp[3] - fp[1]
+    ) > _SMALL_FOOTPRINT * (bounds[3] - bounds[1]):
+        return None
+
+    col_start = min(width - 1, max(0, math.floor((fp[0] - bounds[0]) / x_res)))
+    col_stop = max(col_start + 1, min(width, math.ceil((fp[2] - bounds[0]) / x_res)))
+    row_start = min(height - 1, max(0, math.floor((bounds[3] - fp[3]) / y_res)))
+    row_stop = max(row_start + 1, min(height, math.ceil((bounds[3] - fp[1]) / y_res)))
+
+    clip = (
+        bounds[0] + col_start * x_res,
+        bounds[3] - row_stop * y_res,
+        bounds[0] + col_stop * x_res,
+        bounds[3] - row_start * y_res,
+    )
+    return clip, (slice(row_start, row_stop), slice(col_start, col_stop))
+
+
+def _pad(
+    img: ImageData,
+    slices: tuple[slice, slice],
+    height: int,
+    width: int,
+    bounds: BBox,
+) -> ImageData:
+    """Place `img` into a fully masked `height` x `width` image over `bounds`."""
+    array = img.array
+    fill = img.nodata if img.nodata is not None else 0
+    data = numpy.ma.MaskedArray(
+        numpy.full((array.shape[0], height, width), fill, dtype=array.dtype),
+        mask=True,
+        fill_value=array.fill_value,
+    )
+    data[:, slices[0], slices[1]] = array
+
+    alpha_mask = img.alpha_mask
+    if alpha_mask is not None:
+        full_alpha = numpy.zeros((height, width), dtype=alpha_mask.dtype)
+        full_alpha[slices] = alpha_mask
+        alpha_mask = full_alpha
+
+    return attr.evolve(img, array=data, bounds=bounds, alpha_mask=alpha_mask)
+
+
 def part(
     src_dst: DatasetReader | DatasetWriter | WarpedVRT,
     bounds: BBox,
@@ -436,6 +513,43 @@ def part(
         }
         if vrt_options:
             vrt_params.update(**vrt_options)
+
+        # A small dataset far inside a large request (e.g. a UTM dataset in a
+        # world-scale WebMercator tile) can wrap back onto far-away output
+        # pixels through the inverse projection. Only warp where it is.
+        clip = None
+        if window is None and dst_crs != src_dst.crs:
+            clip = _footprint_clip(src_dst, dst_crs, bounds, width, height)
+
+        if clip is not None:
+            clip_bounds, slices = clip
+            clip_height = slices[0].stop - slices[0].start
+            clip_width = slices[1].stop - slices[1].start
+            vrt_transform, vrt_width, vrt_height = get_vrt_transform(
+                src_dst,
+                clip_bounds,
+                clip_height,
+                clip_width,
+                dst_crs=dst_crs,
+                align_bounds_with_dataset=align_bounds_with_dataset,
+            )
+            vrt_params.update(
+                {"transform": vrt_transform, "width": vrt_width, "height": vrt_height}
+            )
+            img = read(
+                src_dst,
+                indexes=indexes,
+                width=clip_width,
+                height=clip_height,
+                nodata=nodata,
+                vrt_options=vrt_params,
+                out_dtype=out_dtype,
+                resampling_method=resampling_method,
+                reproject_method=reproject_method,
+                unscale=unscale,
+                post_process=post_process,
+            )
+            return _pad(img, slices, height, width, bounds)
 
         return read(
             src_dst,
