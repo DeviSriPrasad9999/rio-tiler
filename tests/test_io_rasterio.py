@@ -1292,6 +1292,6 @@ def test_tile_small_dataset_in_world_tile():
             assert rows.max() <= (tb.top - fp[1]) / y_res + 1
 
         # tiles the dataset is not in at all (it is in Greenland)
-        for z, x, y in [(1, 0, 1), (1, 1, 1), (1, 1, 0), (2, 1, 2), (3, 2, 1)]:
+        for z, x, y in [(1, 0, 1), (1, 1, 1), (1, 1, 0), (2, 1, 2), (3, 2, 3)]:
             if src.tile_exists(x, y, z):
                 assert not src.tile(x, y, z).mask.any(), (z, x, y)
